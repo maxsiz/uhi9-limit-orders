@@ -191,6 +191,165 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         Currency token = zeroForOne ? key.currency1 : key.currency0;
         token.transfer(msg.sender, outputAmount);
     }
+
+    // Internal Functions
+    function tryExecutingOrders(
+        PoolKey calldata key,
+        bool executeZeroForOne
+    ) internal returns (bool tryMore, int24 newTick) {
+        (, int24 currentTick, , ) = poolManager.getSlot0(key.toId());
+        int24 lastTick = lastTicks[key.toId()];
+
+        // Given `currentTick` and `lastTick`, 2 cases are possible:
+
+        // Case (1) - Tick has increased, i.e. `currentTick > lastTick`
+        // or, Case (2) - Tick has decreased, i.e. `currentTick < lastTick`
+
+        // If tick increases => Token 0 price has increased
+        // => We should check if we have orders looking to sell Token 0
+        // i.e. orders with zeroForOne = true
+
+        // ------------
+        // Case (1)
+        // ------------
+
+        // Tick has increased i.e. people bought Token 0 by selling Token 1
+        // i.e. Token 0 price has increased
+        // e.g. in an ETH/USDC pool, people are buying ETH for USDC causing ETH price to increase
+        // We should check if we have any orders looking to sell Token 0
+        // at ticks `lastTick` to `currentTick`
+        // i.e. check if we have any orders to sell ETH at the new price that ETH is at now because of the increase
+        if (currentTick > lastTick) {
+            // Loop over all ticks from `lastTick` to `currentTick`
+            // and execute orders that are looking to sell Token 0
+            for (
+                int24 tick = lastTick;
+                tick < currentTick;
+                tick += key.tickSpacing
+            ) {
+                uint256 inputAmount = pendingOrders[key.toId()][tick][
+                    executeZeroForOne
+                ];
+                if (inputAmount > 0) {
+                    // An order with these parameters can be placed by one or more users
+                    // We execute the full order as a single swap
+                    // Regardless of how many unique users placed the same order
+                    executeOrder(key, tick, executeZeroForOne, inputAmount);
+
+                    // Return true because we may have more orders to execute
+                    // from lastTick to new current tick
+                    // But we need to iterate again from scratch since our sale of ETH shifted the tick down
+                    return (true, currentTick);
+                }
+            }
+        }
+        // ------------
+        // Case (2)
+        // ------------
+        // Tick has gone down i.e. people bought Token 1 by selling Token 0
+        // i.e. Token 1 price has increased
+        // e.g. in an ETH/USDC pool, people are selling ETH for USDC causing ETH price to decrease (and USDC to increase)
+        // We should check if we have any orders looking to sell Token 1
+        // at ticks `currentTick` to `lastTick`
+        // i.e. check if we have any orders to buy ETH at the new price that ETH is at now because of the decrease
+        else {
+            for (
+                int24 tick = lastTick;
+                tick > currentTick;
+                tick -= key.tickSpacing
+            ) {
+                uint256 inputAmount = pendingOrders[key.toId()][tick][
+                    executeZeroForOne
+                ];
+                if (inputAmount > 0) {
+                    executeOrder(key, tick, executeZeroForOne, inputAmount);
+                    return (true, currentTick);
+                }
+            }
+        }
+
+        return (false, currentTick);
+    }
+
+    function executeOrder(
+        PoolKey calldata key,
+        int24 tick,
+        bool zeroForOne,
+        uint256 inputAmount
+    ) internal {
+        // Do the actual swap and settle all balances
+        require(inputAmount <= uint256(type(int256).max), "inputAmount overflow");
+        BalanceDelta delta = swapAndSettleBalances(
+            key,
+            SwapParams({
+                zeroForOne: zeroForOne,
+                // We provide a negative value here to signify an "exact input for output" swap
+                // forge-lint: disable-next-line(unsafe-typecast) -- safe: require above bounds inputAmount to int256
+                amountSpecified: -int256(inputAmount),
+                // No slippage limits (maximum slippage possible)
+                sqrtPriceLimitX96: zeroForOne
+                    ? TickMath.MIN_SQRT_PRICE + 1
+                    : TickMath.MAX_SQRT_PRICE - 1
+            })
+        );
+
+        // `inputAmount` has been deducted from this position
+        pendingOrders[key.toId()][tick][zeroForOne] -= inputAmount;
+        uint256 orderId = getOrderId(key, tick, zeroForOne);
+        uint256 outputAmount = zeroForOne
+            ? uint256(int256(delta.amount1()))
+            : uint256(int256(delta.amount0()));
+
+        // `outputAmount` worth of tokens now can be claimed/redeemed by position holders
+        claimableOutputTokens[orderId] += outputAmount;
+    }
+
+    function swapAndSettleBalances(
+        PoolKey calldata key,
+        SwapParams memory params
+    ) internal returns (BalanceDelta) {
+        // Conduct the swap inside the Pool Manager
+        BalanceDelta delta = poolManager.swap(key, params, "");
+
+        // If we just did a zeroForOne swap
+        // We need to send Token 0 to PM, and receive Token 1 from PM
+        if (params.zeroForOne) {
+            // Negative Value => Money leaving user's wallet
+            // Settle with PoolManager
+            if (delta.amount0() < 0) {
+                _settle(key.currency0, uint128(-delta.amount0()));
+            }
+
+            // Positive Value => Money coming into user's wallet
+            // Take from PM
+            if (delta.amount1() > 0) {
+                _take(key.currency1, uint128(delta.amount1()));
+            }
+        } else {
+            if (delta.amount1() < 0) {
+                _settle(key.currency1, uint128(-delta.amount1()));
+            }
+
+            if (delta.amount0() > 0) {
+                _take(key.currency0, uint128(delta.amount0()));
+            }
+        }
+
+        return delta;
+    }
+
+    function _settle(Currency currency, uint128 amount) internal {
+        // Transfer tokens to PM and let it know
+        poolManager.sync(currency);
+        currency.transfer(address(poolManager), amount);
+        poolManager.settle();
+    }
+
+    function _take(Currency currency, uint128 amount) internal {
+        // Take tokens out of PM to our hook contract
+        poolManager.take(currency, address(this), amount);
+    }
+
 	
 	function getOrderId(
 	    PoolKey calldata key,
