@@ -42,6 +42,7 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         public claimableOutputTokens;
     mapping(uint256 orderId => uint256 claimsSupply) public claimTokensSupply;
 
+
     // Errors
     error InvalidOrder();
     error NothingToClaim();
@@ -85,7 +86,7 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         uint160,
         int24 tick
     ) internal override returns (bytes4) {
-		// TODO
+		lastTicks[key.toId()] = tick;
         return this.afterInitialize.selector;
     }
  
@@ -96,7 +97,35 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         BalanceDelta,
         bytes calldata
     ) internal override returns (bytes4, int128) {
-		// TODO
+		// `sender` is the address which initiated the swap
+        // if `sender` is the hook, we don't want to go down the `afterSwap`
+        // rabbit hole again
+        if (sender == address(this)) return (this.afterSwap.selector, 0);
+
+        // Should we try to find and execute orders? True initially
+        bool tryMore = true;
+        int24 currentTick;
+
+        while (tryMore) {
+            // Try executing pending orders for this pool
+
+            // `tryMore` is true if we successfully found and executed an order
+            // which shifted the tick value
+            // and therefore we need to look again if there are any pending orders
+            // within the new tick range
+
+            // `tickAfterExecutingOrder` is the tick value of the pool
+            // after executing an order
+            // if no order was executed, `tickAfterExecutingOrder` will be
+            // the same as current tick, and `tryMore` will be false
+            (tryMore, currentTick) = tryExecutingOrders(
+                key,
+                !params.zeroForOne
+            );
+        }
+        // New last known tick for this pool is the tick value
+        // after our orders are executed
+        lastTicks[key.toId()] = currentTick;
         return (this.afterSwap.selector, 0);
     }
 
@@ -144,6 +173,7 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
 
         // Remove their `amountToCancel` worth of position from pending orders
         pendingOrders[key.toId()][tick][zeroForOne] -= amountToCancel;
+        
         // Reduce claim token total supply and burn their share
         claimTokensSupply[orderId] -= amountToCancel;
         _burn(msg.sender, orderId, amountToCancel);
