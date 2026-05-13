@@ -14,6 +14,7 @@ import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
  
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
  
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
@@ -97,6 +98,98 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
     ) internal override returns (bytes4, int128) {
 		// TODO
         return (this.afterSwap.selector, 0);
+    }
+
+    // Core Hook External Functions
+    function placeOrder(
+        PoolKey calldata key,
+        int24 tickToSellAt,
+        bool zeroForOne,
+        uint256 inputAmount
+    ) external returns (int24) {
+        // Get lower actually usable tick given `tickToSellAt`
+        int24 tick = getLowerUsableTick(tickToSellAt, key.tickSpacing);
+        // Create a pending order
+        pendingOrders[key.toId()][tick][zeroForOne] += inputAmount;
+
+        // Mint claim tokens to user equal to their `inputAmount`
+        uint256 orderId = getOrderId(key, tick, zeroForOne);
+        claimTokensSupply[orderId] += inputAmount;
+        _mint(msg.sender, orderId, inputAmount, "");
+
+        // Depending on direction of swap, we select the proper input token
+        // and request a transfer of those tokens to the hook contract
+        address sellToken = zeroForOne
+            ? Currency.unwrap(key.currency0)
+            : Currency.unwrap(key.currency1);
+        SafeERC20.safeTransferFrom(IERC20(sellToken), msg.sender, address(this), inputAmount);
+
+        // Return the tick at which the order was actually placed
+        return tick;
+    }
+
+    function cancelOrder(
+        PoolKey calldata key,
+        int24 tickToSellAt,
+        bool zeroForOne,
+        uint256 amountToCancel
+    ) external {
+        // Get lower actually usable tick for their order
+        int24 tick = getLowerUsableTick(tickToSellAt, key.tickSpacing);
+        uint256 orderId = getOrderId(key, tick, zeroForOne);
+
+        // Check how many claim tokens they have for this position
+        uint256 positionTokens = balanceOf(msg.sender, orderId);
+        if (positionTokens < amountToCancel) revert NotEnoughToClaim();
+
+        // Remove their `amountToCancel` worth of position from pending orders
+        pendingOrders[key.toId()][tick][zeroForOne] -= amountToCancel;
+        // Reduce claim token total supply and burn their share
+        claimTokensSupply[orderId] -= amountToCancel;
+        _burn(msg.sender, orderId, amountToCancel);
+
+        // Send them their input token
+        Currency token = zeroForOne ? key.currency0 : key.currency1;
+        token.transfer(msg.sender, amountToCancel);
+    }
+
+    function redeem(
+        PoolKey calldata key,
+        int24 tickToSellAt,
+        bool zeroForOne,
+        uint256 inputAmountToClaimFor
+    ) external {
+        // Get lower actually usable tick for their order
+        int24 tick = getLowerUsableTick(tickToSellAt, key.tickSpacing);
+        uint256 orderId = getOrderId(key, tick, zeroForOne);
+
+        // If no output tokens can be claimed yet i.e. order hasn't been filled
+        // throw error
+        if (claimableOutputTokens[orderId] == 0) revert NothingToClaim();
+
+        // they must have claim tokens >= inputAmountToClaimFor
+        uint256 claimTokens = balanceOf(msg.sender, orderId);
+        if (claimTokens < inputAmountToClaimFor) revert NotEnoughToClaim();
+
+        uint256 totalClaimableForPosition = claimableOutputTokens[orderId];
+        uint256 totalInputAmountForPosition = claimTokensSupply[orderId];
+
+        // outputAmount = (inputAmountToClaimFor * totalClaimableForPosition) / (totalInputAmountForPosition)
+        uint256 outputAmount = inputAmountToClaimFor.mulDivDown(
+            totalClaimableForPosition,
+            totalInputAmountForPosition
+        );
+
+        // Reduce claimable output tokens amount
+        // Reduce claim token total supply for position
+        // Burn claim tokens
+        claimableOutputTokens[orderId] -= outputAmount;
+        claimTokensSupply[orderId] -= inputAmountToClaimFor;
+        _burn(msg.sender, orderId, inputAmountToClaimFor);
+
+        // Transfer output tokens
+        Currency token = zeroForOne ? key.currency1 : key.currency0;
+        token.transfer(msg.sender, outputAmount);
     }
 	
 	function getOrderId(
